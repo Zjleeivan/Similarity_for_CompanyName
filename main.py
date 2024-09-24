@@ -275,7 +275,15 @@ def select_better_similarity(sim1, threshold1, sim2, threshold2):
 
 def find_best_match(row1, remaining_rows, jaccard_threshold, SequenceMatcher_threshold, similarity_type):
     """为给定的公司名称寻找最佳匹配"""
-    id1, company_name1, company1, area1 = row1[['id', 'company_name', 'company', 'area']]  # 获取第一个公司信息
+    # id1, company_name1, company1, area1 = row1[['id', 'company_name', 'company', 'area']]  
+    # 获取第一个公司信息
+    id1 = row1.id           
+    company_name1 = row1.company_name
+    company1 = row1.company
+    area1 = row1.area
+    tokens1 = row1.tokens
+    weights1 = row1.weights
+
     jaccard_best_score = 0  # 初始化加权 Jaccard 相似度的最佳分数
     jaccard_best_match = None  # 初始化加权 Jaccard 相似度的最佳匹配
     SequenceMatcher_best_score = 0  # 初始化加权 SequenceMatcher 相似度的最佳分数
@@ -293,10 +301,12 @@ def find_best_match(row1, remaining_rows, jaccard_threshold, SequenceMatcher_thr
         company_name2 = row2['company_name']
         company2 = row2['company']
         area2 = row2['area']
+        tokens2 = row2['tokens']
+        weights2 = row2['weights']
         
         if similarity_type[1] == '1':  # 判断是否需要计算加权 Jaccard 相似度
             group = 1 
-            jaccard_similarity = weighted_jaccard_similarity(row1['tokens'], row2['tokens'],row1['weights'],row2['weights'])  # 计算加权 Jaccard 相似度
+            jaccard_similarity = weighted_jaccard_similarity(tokens1,tokens2,weights1,weights2)  # 计算加权 Jaccard 相似度
             if jaccard_similarity > jaccard_best_score:  # 更新加权 Jaccard 相似度的最佳分数和最佳匹配
                 jaccard_best_score = jaccard_similarity
                 jaccard_best_match = {
@@ -309,7 +319,7 @@ def find_best_match(row1, remaining_rows, jaccard_threshold, SequenceMatcher_thr
             
         if similarity_type[0] == '1':  # 判断是否需要计算加权 SequenceMatcher 相似度
             group = 2
-            SequenceMatcher_similarity = weighted_SequenceMatcher_similarity(row1['tokens'], row2['tokens'])  # 计算加权 SequenceMatcher 相似度
+            SequenceMatcher_similarity = weighted_SequenceMatcher_similarity(tokens1,tokens2)  # 计算加权 SequenceMatcher 相似度
             if SequenceMatcher_similarity > SequenceMatcher_best_score:  # 更新加权 SequenceMatcher 相似度的最佳分数和最佳匹配
                 SequenceMatcher_best_score = SequenceMatcher_similarity
                 SequenceMatcher_best_match = {
@@ -342,18 +352,14 @@ def find_best_match(row1, remaining_rows, jaccard_threshold, SequenceMatcher_thr
     ]
 
 
-def preprocess_matches(matches_df):
-    """处理匹配结果，保留最大相似度的记录"""
-    max_similarity_indices = matches_df.groupby('BestMatchCompany_Name')['similarity'].idxmax()  # 找到每个公司名称对应的最大相似度记录的索引
-    final_matches = matches_df.copy()  # 复制匹配结果
-    
-    # 清空所有 BestMatch 字段
-    final_matches[['similarity', 'BestMatchID', 'BestMatchCompany_Name', 'BestMatchCompany', 'BestMatchArea']] = None  # 清空所有 BestMatch 字段
-    final_matches.loc[max_similarity_indices, ['similarity', 'BestMatchID', 'BestMatchCompany_Name', 'BestMatchCompany', 'BestMatchArea']] = \
-        matches_df.loc[max_similarity_indices, ['similarity', 'BestMatchID', 'BestMatchCompany_Name', 'BestMatchCompany', 'BestMatchArea']]  # 将最大相似度记录的值复制到最终结果中
-    
-    final_matches.sort_values(by='id1', inplace=True)  # 按照 id1 排序
-    return final_matches  # 返回最终结果
+
+def find_best_match_batch(batch, remaining_rows, jaccard_threshold, SequenceMatcher_threshold, similarity_type):
+    # 处理整个批次
+    matches = []
+    for row1 in batch.itertuples(index=False):
+        match = find_best_match(row1, remaining_rows, jaccard_threshold, SequenceMatcher_threshold, similarity_type)
+        matches.append(match)
+    return matches
 
 def find_matches(df1, df2, jaccard_threshold, SequenceMatcher_threshold, similarity_type, exact_match_score, num_workers=1, batch_size=10):
     """查找匹配的公司"""
@@ -372,19 +378,42 @@ def find_matches(df1, df2, jaccard_threshold, SequenceMatcher_threshold, similar
 
     remaining_df2 = df2[~df2['id'].isin(merged_df.loc[merged_df['_merge'] == 'both', 'id_2'])]  # 获取第二个工作表中未完全匹配的记录
     matched_ids = merged_df[merged_df['_merge'] == 'both']['id_1'].unique()  # 获取第一个工作表中完全匹配的记录的 id
-    df1_remaining = df1[~df1['id'].isin(matched_ids)]  # 获取第一个工作表中未完全匹配的记录
+    df1_remaining = df1[~df1['id'].isin(matched_ids)]  # 获取第一个工作表中未完全匹配的记录 
     
-    # 多进程查找匹配
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:  # 创建进程池
-        futures = []
-        for i in range(0, len(df1_remaining), batch_size):
-            batch = df1_remaining.iloc[i:i + batch_size]  # 提取当前批次
-            remaining_rows = remaining_df2.to_dict(orient='records')  # 转换为列表
-            for index, row1 in batch.iterrows():
-                futures.append(executor.submit(find_best_match, row1, remaining_rows, jaccard_threshold, SequenceMatcher_threshold, similarity_type))  # 将任务提交到进程池
+    # 多进程处理
+    # 准备剩余行的列表,转化为列表
+    remaining_rows = remaining_df2.to_dict(orient='records')
+    # 计算剩余记录数
+    total_records = len(df1_remaining)  
+    # 接收任务返回结果
+    def receive_future(futures, matches, pbar):
+        # 处理已完成的任务
+        for future in as_completed(futures):
+            batch_matches = future.result()  # 获取结果
+            matches.extend(batch_matches)  # 合并所有批次的匹配结果
+            pbar.update(len(batch_matches))  # 更新进度条
+            futures.remove(future)  # 从 futures 列表中移除已完成的任务
 
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Finding best matches"):
-            matches.append(future.result())  # 获取任务的结果，并添加到匹配结果列表中
+    # 创建进程池并处理批次
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = []  # 存储分配的任务
+        max_tasks = num_workers * 2  # 设置最大任务数为进程数的两倍
+        # 进度条
+        with tqdm(total=total_records, desc="Finding best matches") as pbar:
+            for i in range(0, len(df1_remaining), batch_size):
+                batch = df1_remaining.iloc[i:i + batch_size]  # 提取当前批次
+                future = executor.submit(find_best_match_batch, batch, remaining_rows, jaccard_threshold, SequenceMatcher_threshold, similarity_type)
+                futures.append(future)  # 将每个分配任务添加到 futures 列表
+
+                # 处理已完成的任务
+                while len(futures) >= max_tasks:  # 如果 futures 已达到可处理数量
+                    receive_future(futures, matches, pbar)  # 接收并处理已完成的任务
+
+            # 确保所有任务都已完成
+            while futures:  # 如果仍然有未处理的任务
+                receive_future(futures, matches, pbar)  # 处理剩余的任务
+
+            
 
     matches_df = pd.DataFrame(matches, columns=[  # 将匹配结果列表转换为 DataFrame
         'id1', 'Company_Name1', 'similarity', 'similarity_type',
@@ -393,6 +422,19 @@ def find_matches(df1, df2, jaccard_threshold, SequenceMatcher_threshold, similar
     ])
     
     return preprocess_matches(matches_df)  # 处理匹配结果，并返回最终结果
+
+def preprocess_matches(matches_df):
+    """处理匹配结果，保留最大相似度的记录"""
+    max_similarity_indices = matches_df.groupby('BestMatchCompany_Name')['similarity'].idxmax()  # 找到每个公司名称对应的最大相似度记录的索引
+    final_matches = matches_df.copy()  # 复制匹配结果
+    
+    # 清空所有 BestMatch 字段
+    final_matches[['similarity', 'BestMatchID', 'BestMatchCompany_Name', 'BestMatchCompany', 'BestMatchArea']] = None  # 清空所有 BestMatch 字段
+    final_matches.loc[max_similarity_indices, ['similarity', 'BestMatchID', 'BestMatchCompany_Name', 'BestMatchCompany', 'BestMatchArea']] = \
+        matches_df.loc[max_similarity_indices, ['similarity', 'BestMatchID', 'BestMatchCompany_Name', 'BestMatchCompany', 'BestMatchArea']]  # 将最大相似度记录的值复制到最终结果中
+    
+    final_matches.sort_values(by='id1', inplace=True)  # 按照 id1 排序
+    return final_matches  # 返回最终结果
 
 def save_results(matches_df, output_file):
     """保存匹配结果"""
