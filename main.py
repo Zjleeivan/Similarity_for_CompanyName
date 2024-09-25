@@ -4,7 +4,8 @@ import jieba
 import time
 from tqdm import tqdm
 from datetime import timedelta
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
+import asyncio
 import os,difflib,math
 
 
@@ -27,6 +28,24 @@ def preprocess_text(text):
 def normalize_text(text):
     """规范化文本格式"""
     return text.replace('（', '(').replace('）', ')').replace(' ', '')  
+
+
+def standardize_area(area, region_set):
+    """标准化区域字段"""
+    return area.strip()  
+
+def split_leftmost_regions(company_name, region_list):
+    """拆解公司名称中的地域信息"""
+    words = jieba.lcut(company_name)  # 对公司名称进行分词
+    split_regions = []
+
+    for word in words:
+        if word in region_list:  # 如果当前词是地域词，则添加到 split_regions 列表中
+            split_regions = [word] + split_regions
+        else:
+            break
+    return ''.join(words[len(split_regions):]), ''.join(split_regions) ,words[len(split_regions):] + split_regions # 返回公司名称和地域信息,以及公司名称token列表
+
 
 def weighted_jaccard(tokens,steepness: float = 0.0):
     """计算tokens权数"""
@@ -117,23 +136,6 @@ def weighted_levenshtein_similarity(tokens1, tokens2):
     similarity = 1 - (distance / max_len) if max_len > 0 else 1.0  # 确保 max_len 不为 0
 
     return similarity
-
-
-def standardize_area(area, region_set):
-    """标准化区域字段"""
-    return area.strip()  
-
-def split_leftmost_regions(company_name, region_list):
-    """拆解公司名称中的地域信息"""
-    words = jieba.lcut(company_name)  # 对公司名称进行分词
-    split_regions = []
-
-    for word in words:
-        if word in region_list:  # 如果当前词是地域词，则添加到 split_regions 列表中
-            split_regions = [word] + split_regions
-        else:
-            break
-    return ''.join(words[len(split_regions):]), ''.join(split_regions) ,words[len(split_regions):] + split_regions # 返回公司名称和地域信息,以及公司名称token列表
 
 
 def preprocess_company_area(company_name, region_set, similarity_type):
@@ -361,8 +363,35 @@ def find_best_match_batch(batch, remaining_rows, jaccard_threshold, SequenceMatc
         matches.append(match)
     return matches
 
+# 接收任务返回结果
+def receive_future(result, matches, pbar):
+    batch_matches = result  # 获取结果
+    matches.extend(batch_matches)  # 合并所有批次的匹配结果
+    pbar.update(len(batch_matches))  # 更新进度条
+
+# 异步分配任务及多进程执行任务
+async def assign_tasks(df1_remaining, batch_size, remaining_rows, jaccard_threshold, SequenceMatcher_threshold, similarity_type,num_workers):
+    matches = []  # 存储匹配结果
+    total_records = len(df1_remaining)  # 尚未匹配的总记录数
+
+    loop = asyncio.get_event_loop()
+    # 创建进程池
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = []
+        with tqdm(total=total_records, desc="Finding best matches") as pbar:
+            for i in range(0, total_records, batch_size):
+                batch = df1_remaining.iloc[i:i + batch_size]  # 提取当前批次
+                future = loop.run_in_executor(executor, find_best_match_batch, batch, remaining_rows, jaccard_threshold, SequenceMatcher_threshold, similarity_type)
+                future.add_done_callback(lambda fut: receive_future(fut.result(), matches, pbar))  # 异步接收结果
+                futures.append(future)
+
+            # 等待所有 futures 完成
+            await asyncio.gather(*futures)
+
+    return matches
+
 def find_matches(df1, df2, jaccard_threshold, SequenceMatcher_threshold, similarity_type, exact_match_score, num_workers=1, batch_size=10):
-    """查找匹配的公司"""
+    """查找匹配的公司名称"""
     matches = []  # 初始化匹配结果列表
     
     merged_df = pd.merge(df1, df2, on=['company', 'area'], suffixes=('_1', '_2'), how='outer', indicator=True)  # 合并两个工作表的数据，并标记匹配类型
@@ -380,39 +409,11 @@ def find_matches(df1, df2, jaccard_threshold, SequenceMatcher_threshold, similar
     matched_ids = merged_df[merged_df['_merge'] == 'both']['id_1'].unique()  # 获取第一个工作表中完全匹配的记录的 id
     df1_remaining = df1[~df1['id'].isin(matched_ids)]  # 获取第一个工作表中未完全匹配的记录 
     
-    # 多进程处理
     # 准备剩余行的列表,转化为列表
     remaining_rows = remaining_df2.to_dict(orient='records')
-    # 计算剩余记录数
-    total_records = len(df1_remaining)  
-    # 接收任务返回结果
-    def receive_future(futures, matches, pbar):
-        # 处理已完成的任务
-        for future in as_completed(futures):
-            batch_matches = future.result()  # 获取结果
-            matches.extend(batch_matches)  # 合并所有批次的匹配结果
-            pbar.update(len(batch_matches))  # 更新进度条
-            futures.remove(future)  # 从 futures 列表中移除已完成的任务
-
-    # 创建进程池并处理批次
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = []  # 存储分配的任务
-        max_tasks = num_workers * 2  # 设置最大任务数为进程数的两倍
-        # 进度条
-        with tqdm(total=total_records, desc="Finding best matches") as pbar:
-            for i in range(0, len(df1_remaining), batch_size):
-                batch = df1_remaining.iloc[i:i + batch_size]  # 提取当前批次
-                future = executor.submit(find_best_match_batch, batch, remaining_rows, jaccard_threshold, SequenceMatcher_threshold, similarity_type)
-                futures.append(future)  # 将每个分配任务添加到 futures 列表
-
-                # 处理已完成的任务
-                while len(futures) >= max_tasks:  # 如果 futures 已达到可处理数量
-                    receive_future(futures, matches, pbar)  # 接收并处理已完成的任务
-
-            # 确保所有任务都已完成
-            while futures:  # 如果仍然有未处理的任务
-                receive_future(futures, matches, pbar)  # 处理剩余的任务
-
+    # 异步分配任务及多进程执行任务
+    submatches = asyncio.run(assign_tasks(df1_remaining, batch_size, remaining_rows, jaccard_threshold, SequenceMatcher_threshold, similarity_type, num_workers)) 
+    matches.extend(submatches)  # 合并所有批次的匹配结果
             
 
     matches_df = pd.DataFrame(matches, columns=[  # 将匹配结果列表转换为 DataFrame
